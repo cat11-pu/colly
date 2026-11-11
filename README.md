@@ -57,6 +57,7 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Clean API
 -   Fast (>1k request/sec on a single core)
 -   Manages request delays and maximum concurrency per domain
+-   Priority scheduling (P0/P1/P2) by URL/domain patterns with anti-starvation quota
 -   Automatic cookie and session handling
 -   Sync/async/parallel scraping
 -   Caching
@@ -93,6 +94,32 @@ func main() {
 ```
 
 See [examples folder](https://github.com/gocolly/colly/tree/master/_examples) for more detailed examples.
+
+## Priority Scheduling
+
+In `Async` mode, requests can be classified into three priority levels
+(P0 highest, P2 lowest) with rules matching the URL or domain via glob
+patterns or regular expressions. Higher priority requests are dispatched
+first, while a quota guarantees that within every 10 dispatched requests
+at least one comes from the lowest non-empty priority level, so low
+priority traffic is never starved.
+
+```go
+c := colly.NewCollector(colly.Async(true))
+
+err := c.SetPriorityConfig(&colly.PriorityConfig{
+	Rules: []*colly.PriorityRule{
+		{URLGlob: "*/api/*", Priority: colly.PriorityP0},
+		{URLRegexp: `\.jpg$`, Priority: colly.PriorityP1},
+		{DomainGlob: "*.example.org", Priority: colly.PriorityP2},
+	},
+	Parallelism: 8,  // max concurrent requests (default 8)
+	Quota:       10, // at least 1 low-priority request per 10 (default 10)
+})
+```
+
+Requests matching no rule are scheduled with P1. Priority scheduling is
+independent of `LimitRule`, whose semantics are unchanged.
 
 ## Installation
 

@@ -140,6 +140,7 @@ type Collector struct {
 	backend                  *httpBackend
 	wg                       *sync.WaitGroup
 	lock                     *sync.RWMutex
+	scheduler                atomic.Pointer[priorityScheduler]
 	// CacheExpiration sets the maximum age for cache files.
 	// If a cached file is older than this duration, it will be ignored and refreshed.
 	CacheExpiration time.Duration
@@ -690,6 +691,18 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	u = parsedURL.String()
 	c.wg.Add(1)
 	if c.Async {
+		if s := c.scheduler.Load(); s != nil {
+			s.submit(s.priorityOf(u, parsedURL.Hostname()), &priorityTask{
+				u:           u,
+				method:      method,
+				depth:       depth,
+				requestData: requestData,
+				ctx:         ctx,
+				hdr:         hdr,
+				req:         req,
+			})
+			return nil
+		}
 		go c.fetch(u, method, depth, requestData, ctx, hdr, req)
 		return nil
 	}
