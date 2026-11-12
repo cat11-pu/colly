@@ -59,11 +59,22 @@ type LimitRule struct {
 	// RandomDelay is the extra randomized duration to wait added to Delay before creating a new request
 	RandomDelay time.Duration
 	// Parallelism is the number of the maximum allowed concurrent requests of the matching domains
-	Parallelism    int
-	waitChan       chan bool
-	compiledRegexp *regexp.Regexp
-	compiledGlob   *glob.Pattern
-	lock           sync.Mutex
+	Parallelism int
+	// AdaptiveConcurrency enables latency- and error-aware concurrency
+	// control. When enabled, the controller adjusts the effective concurrency
+	// between AdaptiveConcurrencyConfig.MinConcurrency and MaxConcurrency.
+	// Parallelism remains the upper bound when no explicit MaxConcurrency is
+	// configured. When disabled, Parallelism keeps its original meaning.
+	// AdaptiveConcurrencyStats exposes the current limit and window metrics.
+	AdaptiveConcurrency bool
+	// AdaptiveConcurrencyConfig tunes the adaptive controller. Nil selects the
+	// defaults documented on AdaptiveConcurrencyConfig.
+	AdaptiveConcurrencyConfig *AdaptiveConcurrencyConfig
+	waitChan                  chan bool
+	compiledRegexp            *regexp.Regexp
+	compiledGlob              *glob.Pattern
+	lock                      sync.Mutex
+	adaptive                  *adaptiveLimiter
 }
 
 // Init initializes the private members of LimitRule.
@@ -103,6 +114,9 @@ func (r *LimitRule) Init() error {
 		return ErrNoPattern
 	}
 	r.waitChan = make(chan bool, max(r.Parallelism, 1))
+	if r.AdaptiveConcurrency {
+		r.adaptive = newAdaptiveLimiter(r.adaptiveSettings())
+	}
 	return nil
 }
 
@@ -111,12 +125,19 @@ func (r *LimitRule) Init() error {
 // is left zero so the returned rule is independent of the original and
 // must be re-initialized via Init before use.
 func (r *LimitRule) Clone() *LimitRule {
+	var config *AdaptiveConcurrencyConfig
+	if r.AdaptiveConcurrencyConfig != nil {
+		clone := *r.AdaptiveConcurrencyConfig
+		config = &clone
+	}
 	return &LimitRule{
-		DomainRegexp: r.DomainRegexp,
-		DomainGlob:   r.DomainGlob,
-		Delay:        r.Delay,
-		RandomDelay:  r.RandomDelay,
-		Parallelism:  r.Parallelism,
+		DomainRegexp:              r.DomainRegexp,
+		DomainGlob:                r.DomainGlob,
+		Delay:                     r.Delay,
+		RandomDelay:               r.RandomDelay,
+		Parallelism:               r.Parallelism,
+		AdaptiveConcurrency:       r.AdaptiveConcurrency,
+		AdaptiveConcurrencyConfig: config,
 	}
 }
 
@@ -199,17 +220,33 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkRequestHea
 	return resp, os.Rename(filename+"~", filename)
 }
 
-func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc) (*Response, error) {
+func (h *httpBackend) Do(request *http.Request, bodySize int, checkRequestHeadersFunc checkRequestHeadersFunc, checkResponseHeadersFunc checkResponseHeadersFunc) (resp *Response, err error) {
 	r := h.GetMatchingRule(request.URL.Host)
 	if r != nil {
-		r.waitChan <- true
+		var adaptiveGeneration uint64
+		if r.adaptive != nil {
+			adaptiveGeneration = r.adaptive.acquire()
+		} else {
+			r.waitChan <- true
+		}
+		start := time.Now()
 		defer func(r *LimitRule) {
+			latency := time.Since(start)
+			finished := time.Now()
+			failed := resp != nil && (resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests)
+			if err != nil && err != ErrAbortedBeforeRequest && err != ErrAbortedAfterHeaders {
+				failed = true
+			}
 			randomDelay := time.Duration(0)
 			if r.RandomDelay != 0 {
 				randomDelay = time.Duration(rand.Int63n(int64(r.RandomDelay)))
 			}
 			time.Sleep(r.Delay + randomDelay)
-			<-r.waitChan
+			if r.adaptive != nil {
+				r.adaptive.release(adaptiveGeneration, latency, finished, failed)
+			} else {
+				<-r.waitChan
+			}
 		}(r)
 	}
 	if !checkRequestHeadersFunc(request) {

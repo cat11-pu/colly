@@ -57,6 +57,7 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Clean API
 -   Fast (>1k request/sec on a single core)
 -   Manages request delays and maximum concurrency per domain
+-   Optional adaptive concurrency driven by recent latency percentiles and error rate
 -   Automatic cookie and session handling
 -   Sync/async/parallel scraping
 -   Caching
@@ -93,6 +94,32 @@ func main() {
 ```
 
 See [examples folder](https://github.com/gocolly/colly/tree/master/_examples) for more detailed examples.
+
+### Adaptive concurrency
+
+Fixed concurrency is a compromise: it queues requests when the target slows
+down and leaves capacity unused when it speeds up. Set
+`LimitRule.AdaptiveConcurrency` to let Colly adjust concurrency from recent
+latency percentiles and the recent error rate instead. The controller keeps the
+configured tail-latency percentile inside its budget while looking for the
+throughput knee.
+
+```go
+c.Limit(&colly.LimitRule{
+	DomainGlob:          "*",
+	Parallelism:         64, // upper bound when MaxConcurrency is not set
+	AdaptiveConcurrency: true,
+	AdaptiveConcurrencyConfig: &colly.AdaptiveConcurrencyConfig{
+		TargetLatency:     500 * time.Millisecond,
+		LatencyPercentile: 0.99,
+		Window:            3 * time.Second,
+		ErrorRateThreshold: 0.05,
+	},
+})
+```
+
+Adaptive concurrency is disabled by default. When it is disabled,
+`Parallelism`, `Delay`, and `RandomDelay` keep their existing behavior.
 
 ## Installation
 
