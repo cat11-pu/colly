@@ -63,6 +63,7 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Automatic encoding of non-unicode responses
 -   Robots.txt support
 -   Distributed scraping
+-   Optional durable, cross-process deduplicated request queue
 -   Configuration via environment variables
 -   Extensions
 
@@ -93,6 +94,54 @@ func main() {
 ```
 
 See [examples folder](https://github.com/gocolly/colly/tree/master/_examples) for more detailed examples.
+
+## Durable Queue
+
+`queue.InMemoryQueueStorage` and `queue.New(threads, storage)` keep their
+original semantics. To enable durable queueing and cross-process deduplication,
+use `queue.NewPersistent` with a shared state directory:
+
+```go
+q, err := queue.NewPersistent(8, "./crawl-state")
+if err != nil {
+	panic(err)
+}
+defer q.Close()
+
+// Every worker process adds the same source URLs. Requests already pending,
+// in flight, or completed in the shared state are ignored.
+for _, u := range urls {
+	if err := q.AddURL(u); err != nil {
+		panic(err)
+	}
+}
+
+c := colly.NewCollector(colly.AllowURLRevisit())
+if err := q.Run(c); err != nil {
+	panic(err)
+}
+```
+
+See `_examples/persistent_queue` for a runnable example.
+
+The file backend stores normalized URL and request-body identity under
+`pending`, `inflight`, and `done`. An in-flight item is claimed atomically
+before its HTTP request starts and acknowledged after the attempt. If a process
+stops, its claims are recovered on the next queue operation: immediately when
+the owner PID is gone on the same machine, or after `LeaseDuration` for another
+machine. `LeaseDuration` should exceed the longest expected request. Completed
+markers prevent a restart from requesting those URLs again.
+
+Multiple processes on one machine can share the directory directly. For
+multiple machines, place it on a shared POSIX filesystem with working atomic
+rename and file-lock support, or implement the `queue.Storage` and
+`queue.StartStorage`/`queue.AckStorage` interfaces against a shared service. The
+file backend writes a started marker immediately before each HTTP attempt. A
+claimed request which never started is requeued after a crash; a request that
+started is treated as attempted and is not requested again, avoiding duplicate
+requests after a hard restart. As with any local coordinator, a kill in the
+very small interval between writing the marker and sending bytes can still lose
+that attempt.
 
 ## Installation
 

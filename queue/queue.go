@@ -33,6 +33,8 @@ type Queue struct {
 	// Threads defines the number of consumer threads
 	Threads int
 	storage Storage
+	ack     AckStorage
+	start   StartStorage
 	wake    chan struct{}
 	mut     sync.Mutex // guards wake and running
 	running bool
@@ -64,9 +66,13 @@ func New(threads int, s Storage) (*Queue, error) {
 	if err := s.Init(); err != nil {
 		return nil, err
 	}
+	ack, _ := s.(AckStorage)
+	start, _ := s.(StartStorage)
 	return &Queue{
 		Threads: threads,
 		storage: s,
+		ack:     ack,
+		start:   start,
 		running: true,
 	}, nil
 }
@@ -140,10 +146,10 @@ func (q *Queue) Run(c *colly.Collector) error {
 	q.running = true
 	q.mut.Unlock()
 
-	requestc := make(chan *colly.Request)
-	complete, errc := make(chan struct{}), make(chan error, 1)
+	requestc := make(chan *queuedRequest)
+	complete, errc := make(chan error, q.Threads), make(chan error, 1)
 	for i := 0; i < q.Threads; i++ {
-		go independentRunner(requestc, complete)
+		go independentRunner(requestc, complete, q.start, q.ack)
 	}
 	go q.loop(c, requestc, complete, errc)
 	defer close(requestc)
@@ -157,7 +163,17 @@ func (q *Queue) Stop() {
 	q.mut.Unlock()
 }
 
-func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complete <-chan struct{}, errc chan<- error) {
+// Close stops the queue and releases storage resources when the storage
+// backend implements Close() error. It does not delete persisted queue state.
+func (q *Queue) Close() error {
+	q.Stop()
+	if closer, ok := q.storage.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func (q *Queue) loop(c *colly.Collector, requestc chan<- *queuedRequest, complete <-chan error, errc chan<- error) {
 	var active int
 	for {
 		size, err := q.storage.QueueSize()
@@ -173,7 +189,7 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 			break
 		}
 		sent := requestc
-		var req *colly.Request
+		var req *queuedRequest
 		if size > 0 {
 			req, err = q.loadRequest(c)
 			if err != nil {
@@ -194,8 +210,12 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 				if sent == nil {
 					break Sent
 				}
-			case <-complete:
+			case completionErr := <-complete:
 				active--
+				if completionErr != nil {
+					errc <- completionErr
+					return
+				}
 				if sent == nil && active == 0 {
 					break Sent
 				}
@@ -204,21 +224,40 @@ func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complet
 	}
 }
 
-func independentRunner(requestc <-chan *colly.Request, complete chan<- struct{}) {
-	for req := range requestc {
-		req.Do()
-		complete <- struct{}{}
+type queuedRequest struct {
+	request *colly.Request
+	raw     []byte
+}
+
+func independentRunner(requestc <-chan *queuedRequest, complete chan<- error, start StartStorage, ack AckStorage) {
+	for queued := range requestc {
+		if start != nil {
+			if err := start.StartRequest(queued.raw); err != nil {
+				complete <- err
+				continue
+			}
+		}
+		queued.request.Do()
+		var err error
+		if ack != nil {
+			err = ack.AckRequest(queued.raw)
+		}
+		complete <- err
 	}
 }
 
-func (q *Queue) loadRequest(c *colly.Collector) (*colly.Request, error) {
+func (q *Queue) loadRequest(c *colly.Collector) (*queuedRequest, error) {
 	buf, err := q.storage.GetRequest()
 	if err != nil {
 		return nil, err
 	}
 	copied := make([]byte, len(buf))
 	copy(copied, buf)
-	return c.UnmarshalRequest(copied)
+	request, err := c.UnmarshalRequest(copied)
+	if err != nil {
+		return nil, err
+	}
+	return &queuedRequest{request: request, raw: copied}, nil
 }
 
 // Init implements Storage.Init() function
