@@ -64,6 +64,7 @@ Free trialfor new users - use promocode **COLLY** to claim 3GB of proxy
 -   Robots.txt support
 -   Distributed scraping
 -   Configuration via environment variables
+-   Incremental crawling (conditional requests, Last-Modified and content fingerprints)
 -   Extensions
 
 ## Example
@@ -93,6 +94,45 @@ func main() {
 ```
 
 See [examples folder](https://github.com/gocolly/colly/tree/master/_examples) for more detailed examples.
+
+## Incremental crawling
+
+Daily inspection crawls rarely need to re-download every page. Colly supports
+incremental crawling behind an explicit switch — default crawling behavior is
+unchanged unless it is enabled.
+
+When enabled, Colly stores three kinds of validation information per URL and
+reuses them on subsequent requests:
+
+-   the server validator (`ETag`), sent back as `If-None-Match` so the server
+    may answer `304 Not Modified`;
+-   the last modification time (`Last-Modified`), sent back as
+    `If-Modified-Since`;
+-   a SHA-256 content fingerprint of the response body, which detects changes
+    locally even when the server offers no validators.
+
+Unchanged resources are skipped: a `304` response, or a `200` response whose
+body fingerprint matches the stored one, never triggers the
+`OnResponse`/`OnHTML`/`OnXML`/`OnScraped` callbacks. Skipped pages are
+reported through `OnIncrementalSkip`.
+
+```go
+// Persistent, concurrency-safe snapshot store (survives process restarts).
+store := &storage.FileSnapshotStore{Path: "snapshots.jsonl"}
+
+c := colly.NewCollector(
+    colly.SnapshotStorage(store), // enables incremental crawling
+)
+
+c.OnIncrementalSkip(func(r *colly.Request, reason colly.IncrementalSkipReason) {
+    fmt.Println("skipped unchanged page", r.URL, reason)
+})
+```
+
+Use `colly.Incremental()` for an in-memory (non-persistent) store, or
+`COLLY_INCREMENTAL=1` together with `COLLY_SNAPSHOT_FILE=path` through
+environment variables. The `_examples/incremental_benchmark` program simulates
+a local site with 20% changed pages and prints before/after comparison data.
 
 ## Installation
 

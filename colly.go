@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,8 +125,20 @@ type Collector struct {
 	// MaxRequests limit the number of requests done by the instance.
 	// Set it to 0 for infinite requests (default).
 	MaxRequests uint32
+	// Incremental enables incremental crawling. When enabled, validation
+	// information of previous responses (ETag, Last-Modified and a content
+	// fingerprint) is stored and reused on subsequent requests through
+	// conditional headers. Unchanged resources are skipped: the server may
+	// answer with 304 Not Modified, or a 200 response whose body fingerprint
+	// matches the stored one is detected locally. Skipped responses do not
+	// trigger OnResponse/OnHTML/OnXML/OnScraped callbacks.
+	// Default crawling behavior is unchanged while this is false.
+	Incremental bool
 
 	store                    storage.Storage
+	snapshotStore            storage.SnapshotStore
+	snapshotInitOnce         sync.Once
+	snapshotInitErr          error
 	debugger                 debug.Debugger
 	robotsMap                map[string]*robotstxt.RobotsData
 	htmlCallbacks            []*htmlCallbackContainer
@@ -135,6 +149,7 @@ type Collector struct {
 	requestHeadersCallbacks  []RequestCallback
 	errorCallbacks           []ErrorCallback
 	scrapedCallbacks         []ScrapedCallback
+	incrementalSkipCallbacks []IncrementalSkipCallback
 	requestCount             atomic.Uint32
 	responseCount            atomic.Uint32
 	backend                  *httpBackend
@@ -165,6 +180,25 @@ type ErrorCallback func(*Response, error)
 
 // ScrapedCallback is a type alias for OnScraped callback functions
 type ScrapedCallback func(*Response)
+
+// IncrementalSkipReason explains why a resource was skipped during an
+// incremental crawl.
+type IncrementalSkipReason string
+
+const (
+	// IncrementalSkipNotModified means the server responded with
+	// 304 Not Modified to the conditional request.
+	IncrementalSkipNotModified IncrementalSkipReason = "not_modified"
+	// IncrementalSkipFingerprint means the server returned a full response
+	// but its body fingerprint matched the stored one, so the content did
+	// not change.
+	IncrementalSkipFingerprint IncrementalSkipReason = "fingerprint_unchanged"
+)
+
+// IncrementalSkipCallback is invoked instead of the regular response
+// callbacks whenever an incremental crawl determines that a resource is
+// unchanged and therefore skips parsing it.
+type IncrementalSkipCallback func(request *Request, reason IncrementalSkipReason)
 
 // ProxyFunc is a type alias for proxy setter functions.
 type ProxyFunc func(*http.Request) (*url.URL, error)
@@ -308,6 +342,18 @@ var envMap = map[string]func(*Collector, string){
 	},
 	"USER_AGENT": func(c *Collector, val string) {
 		c.UserAgent = val
+	},
+	"INCREMENTAL": func(c *Collector, val string) {
+		if isYesString(val) {
+			c.Incremental = true
+		}
+	},
+	"SNAPSHOT_FILE": func(c *Collector, val string) {
+		if val == "" {
+			return
+		}
+		c.Incremental = true
+		c.snapshotStore = &storage.FileSnapshotStore{Path: val}
 	},
 }
 
@@ -492,6 +538,25 @@ func CheckHead() CollectorOption {
 func CacheExpiration(d time.Duration) CollectorOption {
 	return func(c *Collector) {
 		c.CacheExpiration = d
+	}
+}
+
+// Incremental enables incremental crawling. It uses an in-memory snapshot
+// store, which means validation state is lost when the process exits; combine
+// it with SetSnapshotStorage or the COLLY_SNAPSHOT_FILE environment variable
+// for persistence across runs.
+func Incremental() CollectorOption {
+	return func(c *Collector) {
+		c.Incremental = true
+	}
+}
+
+// SnapshotStorage enables incremental crawling with a custom SnapshotStore
+// (for example a persistent FileSnapshotStore).
+func SnapshotStorage(store storage.SnapshotStore) CollectorOption {
+	return func(c *Collector) {
+		c.Incremental = true
+		c.snapshotStore = store
 	}
 }
 
@@ -723,6 +788,17 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		return nil
 	}
 
+	incremental := c.Incremental && method == "GET"
+	snapshotKey := req.URL.String()
+	var previousSnapshot *storage.ResourceSnapshot
+	if incremental {
+		if err := c.ensureSnapshotStore(); err != nil {
+			return err
+		}
+		previousSnapshot, _ = c.snapshotStore.GetSnapshot(snapshotKey)
+		c.applyConditionalHeaders(req, previousSnapshot)
+	}
+
 	if method == "POST" && req.Header.Get("Content-Type") == "" {
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	}
@@ -748,6 +824,13 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	response, err := c.backend.Cache(req, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, c.CacheDir, c.CacheExpiration)
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
+	}
+	if incremental && err == nil {
+		if skipped, skipErr := c.handleIncrementalResponse(response, request, snapshotKey, previousSnapshot); skipErr != nil {
+			return skipErr
+		} else if skipped {
+			return nil
+		}
 	}
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
@@ -777,6 +860,80 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	c.handleOnScraped(response)
 
 	return err
+}
+
+// applyConditionalHeaders turns a stored snapshot into HTTP conditional
+// request headers. ETag is sent as If-None-Match and Last-Modified as
+// If-Modified-Since, allowing the server to answer 304 Not Modified without
+// transferring the body again.
+func (c *Collector) applyConditionalHeaders(req *http.Request, snapshot *storage.ResourceSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	if snapshot.ETag != "" {
+		req.Header.Set("If-None-Match", snapshot.ETag)
+	}
+	if snapshot.LastModified != "" {
+		req.Header.Set("If-Modified-Since", snapshot.LastModified)
+	}
+}
+
+// handleIncrementalResponse decides whether a response can be skipped in
+// incremental mode and updates the stored snapshot otherwise.
+//
+// It returns skipped=true when the resource is confirmed unchanged, either by
+// a 304 Not Modified status or by a body fingerprint equal to the stored one.
+// Skipped responses never reach the regular response/HTML/XML callbacks.
+func (c *Collector) handleIncrementalResponse(response *Response, request *Request, key string, previous *storage.ResourceSnapshot) (bool, error) {
+	if response == nil {
+		return false, nil
+	}
+	if response.StatusCode == http.StatusNotModified && previous != nil {
+		c.handleOnIncrementalSkip(request, IncrementalSkipNotModified)
+		return true, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return false, nil
+	}
+
+	fingerprint := fingerprintBody(response.Body)
+	if previous != nil && previous.Fingerprint != "" && fingerprint == previous.Fingerprint {
+		c.handleOnIncrementalSkip(request, IncrementalSkipFingerprint)
+		return true, nil
+	}
+
+	snapshot := &storage.ResourceSnapshot{
+		Key:          key,
+		ETag:         response.Headers.Get("ETag"),
+		LastModified: response.Headers.Get("Last-Modified"),
+		Fingerprint:  fingerprint,
+		UpdatedAt:    time.Now().Unix(),
+	}
+	if err := c.snapshotStore.PutSnapshot(snapshot); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// fingerprintBody returns the hex encoded SHA-256 digest of the response body.
+func fingerprintBody(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *Collector) handleOnIncrementalSkip(request *Request, reason IncrementalSkipReason) {
+	if c.debugger != nil {
+		c.debugger.Event(createEvent("incrementalSkip", request.ID, c.ID, map[string]string{
+			"url":    request.URL.String(),
+			"reason": string(reason),
+		}))
+	}
+	c.lock.RLock()
+	callbacks := slices.Clone(c.incrementalSkipCallbacks)
+	c.lock.RUnlock()
+	for _, f := range callbacks {
+		f(request, reason)
+	}
 }
 
 func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
@@ -1067,6 +1224,18 @@ func (c *Collector) OnScraped(f ScrapedCallback) {
 	c.lock.Unlock()
 }
 
+// OnIncrementalSkip registers a function that runs when incremental crawling
+// determines that a resource is unchanged and skips parsing it. It is only
+// invoked while Incremental is enabled.
+func (c *Collector) OnIncrementalSkip(f IncrementalSkipCallback) {
+	c.lock.Lock()
+	if c.incrementalSkipCallbacks == nil {
+		c.incrementalSkipCallbacks = make([]IncrementalSkipCallback, 0, 4)
+	}
+	c.incrementalSkipCallbacks = append(c.incrementalSkipCallbacks, f)
+	c.lock.Unlock()
+}
+
 // SetClient will override the previously set http.Client
 func (c *Collector) SetClient(client *http.Client) {
 	c.backend.Client = client
@@ -1101,6 +1270,34 @@ func (c *Collector) SetStorage(s storage.Storage) error {
 	c.store = s
 	c.backend.Client.Jar = createJar(s)
 	return nil
+}
+
+// SetSnapshotStorage enables incremental crawling backed by the provided
+// SnapshotStore. The store is initialized here and snapshots survive across
+// Collector instances as long as the same store (or the same backing file)
+// is reused.
+func (c *Collector) SetSnapshotStorage(store storage.SnapshotStore) error {
+	if err := store.SnapshotInit(); err != nil {
+		return err
+	}
+	c.snapshotStore = store
+	c.Incremental = true
+	c.snapshotInitOnce.Do(func() {})
+	return nil
+}
+
+// ensureSnapshotStore lazily initializes the snapshot storage. Collector
+// options run after Init(), so a store supplied via SnapshotStorage may not be
+// initialized yet when the first request is made. When Incremental is enabled
+// without an explicit store, an InMemorySnapshotStore is used.
+func (c *Collector) ensureSnapshotStore() error {
+	c.snapshotInitOnce.Do(func() {
+		if c.snapshotStore == nil {
+			c.snapshotStore = &storage.InMemorySnapshotStore{}
+		}
+		c.snapshotInitErr = c.snapshotStore.SnapshotInit()
+	})
+	return c.snapshotInitErr
 }
 
 // SetProxy sets a proxy for the collector. This method overrides the previously
